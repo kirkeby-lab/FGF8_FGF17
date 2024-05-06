@@ -1,0 +1,810 @@
+---
+title: "Seurat_basics, FGF8&17, 2022-02-13"
+output: html_notebook
+---
+  
+# General inf.:
+  
+### Reference tutorials: 
+* [sctransform](https://satijalab.org/seurat/v3.2/sctransform_vignette.html)
+* [Guided tutorial --- 2,700 PBMCs](https://satijalab.org/seurat/v3.2/pbmc3k_tutorial.html)
+* [Cell Cycle Regression](https://satijalab.org/seurat/v3.2/cell_cycle_vignette.html)
+* [scRNA-seq guide](https://www.embopress.org/doi/full/10.15252/msb.20188746)
+* [Differential Expression Testing](https://satijalab.org/seurat/v3.2/de_vignette.html)
+* [Visualization](https://satijalab.org/seurat/v3.2/visualization_vignette.html)
+* [Demultiplex Cell Hashing data](https://satijalab.org/seurat/v3.2/hashing_vignette.html)
+* [Internal cluster quality assessment] (https://hbctraining.github.io/scRNA-seq/lessons/08_SC_clustering_quality_control.html)
+* [Remove batch effect](https://satijalab.org/seurat/v3.2/immune_alignment.html)
+
+### [Data inf.]
+
+
+```{r}
+library(Seurat)
+library(ggplot2)
+library(sctransform)
+library(dplyr) # R command pip
+library("readr") #for reading rds
+#library("loomR")
+```
+
+# 1. Setup the Seurat Object
+```{bash}
+#Remove "_" from feature names
+#cat features.tsv | sed "s/_/-/g" > features2.tsv
+#mv features2.tsv features.tsv
+#gzip features.tsv
+cd seurat_basics/data
+ln -s 220203-human-differentiated-cells_17-cycles/220203-human-differentiated-cells_17-cycles_full_seurat.rds .
+```
+
+
+```{r}
+IN_DIR <- "seurat_basics/data/"
+OUT_DIR <- "seurat_basics/output/"
+NAME <- "FGF"
+IN_FILE <- paste0(IN_DIR, "220203-human-differentiated-cells_17-cycles_full_seurat.rds")
+IN_FILE
+```
+
+
+```{r}
+#Check working directory
+getwd()
+# Load in the h19 UMI matris (row: genes; col: cells)
+#Have a look at the data
+#name[1:3, 1:3]
+# Initialize the Seurat object with at least 200 genes in each cell.
+#h19 <- CreateSeuratObject(counts = h19.data, project = "h19_cDNA", min.features = 200)
+#So, now all the cells with <= 200 expressed genes are now removed: for dead, low-quality cells or empty droplets will often have very few genes
+#h19@meta.data$nFeature_RNA %>% min
+
+name <- readRDS(IN_FILE)
+#Have a look at the Seurat object
+name
+
+name@meta.data[1:3,]
+#nCount_RNA: UMI counts within cells
+#nFeature_RNA: gene counts within cells
+```
+
+
+
+# 2. Filter out lower quality cells
+
+## 2.0 Remove doublets and Negative
+```{r}
+name@meta.data[1:5, ]
+table(name$doublet)
+table(name$hash.ID)
+name <- subset(name, subset=hash.ID%in%c("Doublet", "Negative"), invert=T)
+table(name$doublet)
+#name$hash.ID <- droplevels(name$hash.ID)
+table(name$hash.ID)
+```
+
+## 2.1 Calculate percent.mt and percent.rb and add it as a column to h19@meta.data
+```{r}
+#Calculate mitochondral proportion
+name[["percent.mt"]] <- PercentageFeatureSet(name, pattern = "^MT-")
+
+#Calculate ribosomal proportion
+name[["percent.rb"]] <- PercentageFeatureSet(name, pattern = "^RP[SL]")
+
+#Have a look at the results
+#For cell AAACCCAAGATTGCGG-1, there are 4.42% of UMIs are mapped onto mt genome
+```
+
+## 2.2 Check the data distribution 
+```{r, fig.height=4}
+#Violin plotting the within-cell gene nr, UMI nr and mt percentage
+VlnPlot(name, features = c("nFeature_RNA", "nCount_RNA", "percent.mt", "percent.rb"), ncol = 4)
+```
+
+```{r}
+plot1 <- FeatureScatter(name, feature1 = "nCount_RNA", feature2 = "nFeature_RNA")
+plot2 <- FeatureScatter(name, feature1 = "nFeature_RNA", feature2 = "percent.mt")
+plot3 <- FeatureScatter(name, feature1 = "nFeature_RNA", feature2 = "percent.rb")
+plot1 # Within-cell UMI counts and gene counts are positively correlated, so we just need to remove outlier cells based one of them might be ok.
+plot2 # Within-cell mt percentage tends to be large when within-cell UMI counts are low
+plot3 # Not the same trend as mt, mostly behaves not bad, except a few deviate dramatically >50%, we will remove those outlier
+```
+
+## 2.3 Remove cell outliers
+```{r, fig.height=3.5}
+Idents(name) <- name$hash.ID
+#name <- subset(name, subset = nFeature_RNA>200 & nFeature_RNA<quantile(name$nFeature_RNA, 0.99) & percent.mt<quantile(name$percent.mt, 0.98) & percent.rb<quantile(name$percent.rb, 0.98))
+name <- subset(name, subset = nFeature_RNA>200 & nFeature_RNA<quantile(name$nFeature_RNA, 0.99) & percent.rb<quantile(name$percent.rb, 0.98))
+#Violin plotting the within-cell gene nr, UMI nr and mt percentage again
+pdf(paste0(OUT_DIR, NAME, "_QC_Violin.pdf"), h=3, w=15)
+VlnPlot(name, features = c("nFeature_RNA", "nCount_RNA", "percent.mt", "percent.rb"), ncol = 4)
+dev.off()
+```
+
+```{r}
+Session END
+#Check the violin plot and see whether everything looks well, otherwise, rerun everything with proper cutoff
+```
+
+
+## 2.4 Remove mt and rp genes (optional)
+```{r}
+### Remove Mt and Rp genes (Those genes were needed for filtering low quality cells, but will be removed from downstream analysis)
+rmMtRp <- function(name) {
+  Mt <- grepl(rownames(name), pattern=("^MT-"))
+  RP <- grepl(rownames(name), pattern=("^RP[SL]"))
+  keep_genes <- rownames(name)[!(Mt+RP)]
+  
+  name@assays$RNA@counts <- name@assays$RNA@counts[keep_genes,]
+  name@assays$RNA@data <- name@assays$RNA@data[keep_genes,]
+  name@assays$RNA@meta.features <- name@assays$RNA@meta.features[keep_genes,]
+  
+  rm(Mt, RP, keep_genes)
+  return(name)
+}
+
+name <- rmMtRp(name)
+```
+
+```{r}
+#Have a look at the object again, now we have 15777 cells left
+name
+saveRDS(name, file = paste0(IN_DIR, NAME,  "_processed.RDS"))
+```
+
+# 3. SCTransform: Normalization,feature selection and scaling 
+```{r}
+#vars.to.regress = c("percent.mt", "percent.rb") is not necessary here, because they both may play important roles in controlling stem cell fate.
+name = SCTransform(name, verbose = FALSE, variable.features.n=2000, vars.to.regress = c("hash.ID"))
+
+#Look at the data:
+name
+#In the SCT assay, only 21710 genes left (orig: 32738), the rest are removed to reduce experimental workflow introduced gene expression variation.
+#3000 variable genes are selected
+```
+
+```{r}
+name[["SCT"]]@scale.data[1:3, 1:3] #Here are residuals (normalized values), the main results. Postive
+#Positive residuals for a given gene in a given cell indicate that we observed more UMIs than expected given the gene???s average expression in the population and cellular sequencing depth
+#while Negative residuals mean the opposite.
+#(but not significantly more or less)
+
+name[["SCT"]]@counts[1:3, 1:3] #Corrected UMI counts
+name[["SCT"]]@data[1:3,1:3] #Log-normalized corrected UMI counts, can be used for DE gene identification, integration and visualization
+
+#Top variable genes
+name[["SCT"]]@var.features[1:10]
+```
+```{r}
+#Check the gene expression variaiton (among cells) by plotting the normalized log transformed corrected count
+name[["SCT"]]@data %>% dim()
+Count.mean.by.gene = name[["SCT"]]@data %>% as.matrix() %>% rowMeans()
+Count.sd.by.gene <- name[["SCT"]]@data %>% as.matrix() %>% apply(., 1, sd)
+plot(Count.mean.by.gene, Count.sd.by.gene)
+```  
+**Result checking** The Log-normalized corrected UMI counts among cells for each gene mostly has a mean of 0 (max: around 6) and a sd between 0 and 0.5 (the max does not exceed 2); 
+Relation between the two: when mean is around 0 (majority), sd shows a trend of increasing, however with a very limited amount (0 to 0.5). After that, gene expression variation tends to decrease slightly as count mean increases, which shouldn't be a concern.
+
+
+# 4. Regress out cell cycle noises (optional)
+* G1: not cycling
+* S: cycling (DNA synthesis)
+* G2: cycling (Growth and preparation for mitosis)
+* M: cycling (Cell division)
+
+Regress out biological covariate only for trajectory inference and if other biological processes of interest are not masked by the regressed out biological covariate.
+
+## 4.1 Prepare the cell cycle markers
+```{r}
+cycle_gene <- read.table("data/regev_lab_cell_cycle_genes.txt")
+cycle_gene <- cycle_gene[,1, drop=TRUE]
+
+cycle_gene[1:5]
+```
+
+```{r}
+#Only those cell cycle markers that are also the selected variable genes will be used
+#Those cell cycle markers that are not varaible genes will probably not have a big impact on the data heterogeneity anyway.
+s.genes_orig <- cycle_gene[1:43, drop=TRUE]
+s.genes <- intersect(cycle_gene[1:43, drop=TRUE], name[["SCT"]]@var.features)
+L = length(cycle_gene)
+L
+g2m.genes_orig <- cycle_gene[44:L, drop=TRUE]
+g2m.genes <- intersect(cycle_gene[44:L, drop=TRUE], name[["SCT"]]@var.features)
+
+s.genes
+g2m.genes
+```
+
+## 4.2 Run PCA and have a check whether some of the cell cycle markers explain the top PCs
+```{r}
+name <- RunPCA(name, features = VariableFeatures(name), ndims.print = 1:10, nfeatures.print = 10)
+```
+
+```{r}
+#Look for the overlapping genes between PC markers and cell cycle markers:
+for (i in 1:10){
+  cpn <- name@reductions$pca[,i] %>% order(.,decreasing=T) %>% 
+    rownames(name@reductions$pca[,1])[.] %>% .[1:10]
+  cat("cp",i,"vs. s.gene", intersect(cpn, s.genes), "\n")
+  cat("cp",i, "vs. g2m.gene", intersect(cpn, g2m.genes), "\n")
+}
+```
+CP 4 (sharing TYMS PCNA with s.gene), 
+CP 7 (sharing TYMS PCNA with s.gene),
+CP 10 (sharing TYMS with s.gene) have overlapping markers with the cell cycle
+
+Plotting the gene expression heatmap for those 3 PCs:
+```{r}
+DimHeatmap(name, dims = c(4,7,10))
+```
+
+## 4.3 Assign Cell-Cycle Scores
+
+We assign each cell a score, based on its expression of G2/M and S phase markers. These marker sets should be anticorrelated in their expression levels, and cells expressing neither are likely not cycling and in G1 phase.
+```{r}
+name <- CellCycleScoring(name, s.features = s.genes, g2m.features = g2m.genes, set.ident = TRUE)
+
+# view cell cycle scores and phase assignments
+head(name@meta.data[,8:11])
+```
+
+Plotting the S.Score and G2M.Score
+```{r, fig.height=4}
+VlnPlot(name, features = c("S.Score","G2M.Score"))
+```
+
+## 4.4 Visualize the distribution of cell cycle markers across cell cycles. This is just for myself
+```{r}
+RidgePlot(name, features = c("TYMS", "PCNA", "TOP2A", "UBE2C", "CENPF", "CDC20"), ncol = 3)
+#TYMS, PCNA: s marker
+#The rest are G2M markers
+```
+## 4.5 Running a PCA on cell cycle genes
+```{r}
+name <- RunPCA(name, features = c(s.genes, g2m.genes), assay.type = "SCT") #features: Features to compute PCA on.
+DimPlot(name)
+```
+**Result checking** Maybe it's not supringly to see that cells can be well separate by phase, so we need to regress out cell cycle noisess.
+
+## 4.6 Regress out cell cycle noises
+
+** This step seems a bit repeat what the step 3 did, but it's necessary if we want to use the sctransform function, because the cell cycle scores need to be calculated from normalized and log-transformed data (H19[["SCT"]]@data, this is the normalized and log-transformed count, this is more or less what NormalizeData would get).**
+```{r}
+#It is the cell cycle scores that will be used for regressing out cell cycle noises not the assgined cell phases
+name = SCTransform(name, assay = "RNA", new.assay.name = "SCT", 
+                  vars.to.regress = c("S.Score", "G2M.Score", "hash.ID"), verbose = FALSE, variable.features.n=2000)
+```
+
+## 4.7 Running a PCA on cell cycle genes again to see whether we have succeeded in removing cell cycle noises or not.
+```{r}
+#Adjust the cell cycle genes based on the new selected HVG
+s.genes2 <- intersect(s.genes_orig, name[["SCT"]]@var.features)
+g2m.genes2 <- intersect(g2m.genes_orig, name[["SCT"]]@var.features)
+name <- RunPCA(name, features = c(s.genes2, g2m.genes2), assay.type = "SCT") 
+
+DimPlot(name, group.by = "Phase", reduction="pca")
+```
+
+**Result checking ** Now the cell cycle noises has been greatly reduced, though the data for the G2M phase show much wider distribution comparing to the other two phases.
+
+Let's check it in a different way: (Do heatmap for the gene expression of 50 varaible genes, and group cells by their phases)
+```{r, fig.height=4}
+DoHeatmap(name, assay="SCT", features = name@assays$SCT@var.features[450:500], group.by = "Phase")
+```
+**Result analysis** There is still some noticable difference between different cell cycle phases, so next, I will try to use dataset integration to remove the cell cycle noises as batch effect. Please see the "RmPhaseBatch*" files.
+
+```{r}
+Session END
+```
+
+# 5. Dimentional reduction
+
+## 5.1 PCA
+```{r}
+#Run PCA again
+name <- RunPCA(name, assay = "SCT", reduction.name = "pca", 
+               reduction.key = "PC", features = VariableFeatures(object = name), npcs = 100) 
+
+#Looking for the true dimensionality of the data
+#The Jackstraw method does not work SCTransform() processed data
+#Based on the PCA data we have in the object, and see how much variation has been explained by each PC.
+ElbowPlot(object=name, ndim=50, reduction="pca") 
+```
+**Result** Similar result to what we got after we removed cell cycle noise, 15 or 35 may be two good PCs to try.
+
+## 5.2 UMAP
+```{r}
+dim <- 20
+name <- RunUMAP(name, reduction = "pca", dims = 1:dim) 
+```
+**Cells are grouped according to cell cycle phases, which will be an issue during clustering**
+  
+## 5.3 QC plots
+```{r, fig.height=2.0, fig.width=5}
+pdf(paste0(OUT_DIR, NAME, "_UMAP_Phase.pdf"))
+DimPlot(name, reduction = "umap", group.by = "Phase")
+dev.off()
+
+#Visualize the cell cycle phases side-by-side
+pdf(paste0(OUT_DIR, NAME, "_UMAP_split_by_Phase.pdf"), h=3, w=10)
+DimPlot(name, reduction = "umap", split.by = "Phase")
+dev.off()
+```
+
+QC matrix plots
+```{r, fig.height=3, fig.width=3}
+metrics <-  c("percent.mt", "percent.rb", "nCount_RNA", "nFeature_RNA")
+pdf(paste0(OUT_DIR,  NAME, "_QC_matrix_UMAP.pdf"), h=6, w=8)
+FeaturePlot(name, 
+            reduction = "umap", 
+            features = metrics,
+            pt.size = 0.4, 
+            sort.cell = TRUE,
+            min.cutoff = 'q10',
+            label = F) & NoLegend()
+dev.off()
+```
+
+```{r, fig.height=3, fig.width=3}
+pdf(paste0(OUT_DIR,  NAME, "_hash.ID_UMAP.pdf"), h=3, w=5)
+DimPlot(name, group.by="hash.ID")
+dev.off()
+```
+
+# 6. Clustering
+```{r}
+#' This function also calculate the silhouette coefficient
+clusteringKit <- function(name, assay, dim, res.range, reduction){
+  DefaultAssay(name) <- assay
+  name <- FindNeighbors(name, dims=1:dim, reduction=reduction) 
+  
+  for (i in res.range){
+    name <- FindClusters(name, resolution=i)
+  }
+  
+  DefaultAssay(name) <- assay
+  dist.matrix <- dist(x = Embeddings(object = name[[reduction]])[, 1:dim])
+  
+  clusters <- paste0(assay,"_snn_res.", res.range)
+  
+  getSil <- function(clr) {
+    clr <- name@meta.data[[clr]]
+    sil <- cluster::silhouette(x = as.numeric(x = as.factor(x = clr)), dist = dist.matrix)
+    sil_value <- sil
+    return(sil_value)
+  }
+  
+  #sls <- mclapply(clusters, getSil, mc.cores = 1)
+  sls <- lapply(clusters, getSil)
+  sls_median <- sapply(sls, function(x) median(x[,3])) %>% setNames(., res.range)
+  sls_neg_prop <- sapply(sls, function(x) sum(x[,3]<0)/length(x[,3])) %>% setNames(., res.range)
+  p_list <- lapply(res.range, function(res){
+    Idents(name) = name@meta.data[paste0(assay, "_snn_res.",res)]
+    DimPlot(name, reduction = "umap", label = TRUE, group.by = paste0(assay, "_snn_res.",res), pt.size =0.3, raster=F)
+  })
+  
+  return(list(name=name, sls_median=sls_median, sls_neg_prop=sls_neg_prop, dimplots=p_list))
+}
+```
+
+```{r}
+clustered <- clusteringKit(name, assay="SCT", dim=dim, res.range=seq(0.1, 1, 0.1), reduction="pca")
+name <- clustered$name
+```
+
+```{r}
+pdf(paste0(OUT_DIR, NAME, "_Sil.pdf"))
+plot(names(clustered$sls_median), clustered$sls_median, xlab="Resolution", ylab="Median Sil", type="l", col="green") #+ ggplot2::ggtitle("Median Sil")
+plot(names(clustered$sls_neg_prop), clustered$sls_neg_prop, xlab="Resolution", ylab="Negative Sil proportion", type="l", col="green") #+ ggplot2::ggtitle("Negative Sil proportion")
+dev.off
+
+p_list <- clustered$dimplots
+pdf(paste0(OUT_DIR, NAME, "_Clustering_diff_res.pdf"), h=12, w=12)
+cowplot::plot_grid(ncol= 2, p_list[[1]], p_list[[2]], p_list[[3]], p_list[[4]], p_list[[5]])
+dev.off()
+```
+
+
+```{r}
+saveRDS(name, paste0(OUT_DIR, NAME, "processed.RDS"))
+```
+
+```{r}
+# Choose a resolution
+res=0.5
+```
+
+# 7. DE gene identification
+```{r}
+Idents(name) <- name@meta.data[, paste0("SCT_snn_res.", res)]
+name.markers <- FindAllMarkers(name, only.pos = TRUE, min.pct = 0.1, logfc.threshold = 0.25)
+head(name.markers)
+name.markers <- subset(name.markers, subset=p_val_adj<0.05)
+
+write.csv2(name.markers, paste0(OUT_DIR, NAME, "_marker_table_res.", res, ".csv"))
+```
+
+```{r}
+top_N = 5
+tops <- name.markers %>% group_by(cluster) %>% top_n(n=top_N, wt=avg_log2FC)
+
+pdf(paste0(OUT_DIR, NAME, "_Diff_Expr_heatmap_res.", res, ".pdf"), h=7, w=12)
+DoHeatmap(name, features = tops$gene) + NoLegend()
+dev.off()
+```
+
+```{r, fig.height=15, fig.width=15}
+# FeaturePlot(name, 
+#             reduction = "umap",
+#             features = tops$gene,
+#             pt.size = pt.size, keep.scale = "feature",
+#             label=F, ncol=6) #& NoLegend()
+```
+
+# 8. GO 
+```{r, fig.width=12, fig.height=7}
+GoAnalysis <-  function(name.markers, clr) {
+  up <- name.markers[name.markers$cluster==clr, "gene"]
+  UP_BP <- enrichGO(up, keyType = "SYMBOL", OrgDb='org.Hs.eg.db', ont="BP", pvalueCutoff = 0.05, qvalueCutoff = 0.2)
+  #saveRDS(UP_BP, paste0(OUT_DIR, NAME, "_clr", clr, "_GO", NAME, "_", res, ".RDS"))
+  #y <- as.data.frame(UP_BP@result)
+  y <-UP_BP
+  firstup <- function(x) {
+    substr(x, 1, 1) <- toupper(substr(x, 1, 1))
+    x
+  }
+  y@result$Description <- firstup(y@result$Description)
+  #y@result[,"P.adjust(*10^5)"] <- y@result$p.adjust*100000
+  #y@result[,"p.adjust"] <- (y@result$p.adjust)*100000
+  y@result$Description[1:30]
+  
+  #options("scipen"=100, "digits"=4)
+  enrichplot::dotplot(y, x = "geneRatio", showCategory = 30, font.size = 14, title = "") #"Upregulated in B21 (vs B0)")
+  
+  #pdf(paste0(OUT_DIR, NAME, "_clr", clr, "_GO_", NAME, "_", res, ".pdf"), w=12, h=7)
+  p= enrichplot::dotplot(y, x = "geneRatio", showCategory = 30, font.size = 14, title = "") #"Upregulated in B21 (vs B0)")
+  #dev.off()
+  
+  return(list(UP_BP=UP_BP, GO.table=as.data.frame(y@result), enriched.GO.plot=p))
+}
+
+library(clusterProfiler)
+for (clr in unique(name@meta.data[, paste0("SCT_snn_res.", res)])) {
+  goed <- GoAnalysis(name.markers, clr)
+  saveRDS(goed$UP_BP, paste0(OUT_DIR, NAME, "_clr", clr, "_GO_res.", res, ".RDS"))
+  
+  pdf(paste0(OUT_DIR, NAME, "_clr", clr, "_GO_res.", res, ".pdf"), w=12, h=7)
+  print(goed$enriched.GO.plot)
+  dev.off()
+  
+  write.csv2(goed$GO.table, paste0(OUT_DIR, NAME, "_clr", clr, "_GO_", res, ".csv"))
+}
+
+```
+
+# 9. markers
+```{r, fig.height=6, fig.width=8}
+neuroepithelial.markers <- c("NES", "HES1", "SOX2", "SOX10", "CDH1", "NOTCH1")
+pdf(paste0(OUT_DIR, NAME, "_neuroepithelial.markers.pdf"), h=6, w=8)
+FeaturePlot(ncol=2, name, features=neuroepithelial.markers) #+ ggplot2::ggtitle("Neuroepithelial.markers")
+dev.off()
+```
+
+```{r, fig.height=6, fig.width=8}
+neuroepithelial.markers <- c("NES", "HES1", "HES3", "SOX2", "SOX10", "CDH1", "NOTCH1")
+pdf(paste0(OUT_DIR, NAME, "_neuroepithelial.markers.pdf"), h=6, w=12)
+FeaturePlot(ncol=3, name, features=neuroepithelial.markers) #+ ggplot2::ggtitle("Neuroepithelial.markers")
+dev.off()
+```
+
+```{r, fig.height=9, fig.width=12}
+#CD45: PTPRC
+Radial.glial.markers <- c("FABP7", "GFAP", "SLC1A3", "EOMES", "PAX6", "BLBP", "NG2", "OLIG1", "OLIG2", "MOG", "MBP", "NCAM", "ALDH1L1", "PTPRC", "TPH1", "TPH2")
+pdf(paste0(OUT_DIR, NAME, "_Radial.glial.markers.pdf"), h=9, w=12)
+FeaturePlot(ncol=3, name, features=Radial.glial.markers)
+dev.off()
+```
+```{r, fig.height=9, fig.width=12}
+# clr2: glia progenitors # also check the GO annotation of these genes
+#CRABP1: a muller cell marker: https://www.proteinatlas.org/ENSG00000166426-CRABP1/single+cell+type
+markers.matrix <- read.csv2(paste0(OUT_DIR, "FGF_marker_table_res.0.1.csv"))
+clr2.markers <- markers.matrix$gene[markers.matrix$cluster=="2"][1:9]
+pdf(paste0(OUT_DIR, NAME, "_SCT_snn_res.0.1_clr2.markers.pdf"), h=9, w=12)
+FeaturePlot(ncol=3, name, features=clr2.markers) 
+dev.off()
+```
+
+```{r, fig.height=9, fig.width=12}
+# clr2: glia progenitors # also check the GO annotation of these genes
+#CRABP1: a muller cell marker: https://www.proteinatlas.org/ENSG00000166426-CRABP1/single+cell+type
+markers.matrix <- read.csv2(paste0(OUT_DIR, "FGF_marker_table_res.0.1.csv"))
+clr0.markers <- markers.matrix$gene[markers.matrix$cluster=="0"][1:9]
+pdf(paste0(OUT_DIR, NAME, "_SCT_snn_res.0.1_clr0.markers.pdf"), h=9, w=12)
+FeaturePlot(ncol=3, name, features=clr0.markers) #+ ggplot2::ggtitle("SCT_snn_res.0.1_clr0.markers")
+dev.off()
+```
+
+```{r, fig.height=9, fig.width=12}
+# clr1: glia progenitors # also check the GO annotation of these genes
+markers.matrix <- read.csv2(paste0(OUT_DIR, "FGF_marker_table_res.0.1.csv"))
+clr1.markers <- markers.matrix$gene[markers.matrix$cluster=="1"][1:9]
+pdf(paste0(OUT_DIR, NAME, "_SCT_snn_res.0.1_clr1.markers.pdf"), h=9, w=12)
+FeaturePlot(ncol=3, name, features=clr1.markers) 
+dev.off()
+```
+
+```{r, fig.height=9, fig.width=12}
+markers.matrix <- read.csv2(paste0(OUT_DIR, "FGF_marker_table_res.0.1.csv"))
+clr3.markers <- markers.matrix$gene[markers.matrix$cluster=="3"][1:9]
+pdf(paste0(OUT_DIR, NAME, "_SCT_snn_res.0.1_clr3.markers.pdf"), h=9, w=12)
+FeaturePlot(ncol=3, name, features=clr3.markers) 
+dev.off()
+```
+
+```{r, fig.height=9, fig.width=12}
+markers.matrix <- read.csv2(paste0(OUT_DIR, "FGF_marker_table_res.0.1.csv"))
+clr4.markers <- markers.matrix$gene[markers.matrix$cluster=="4"][1:9]
+pdf(paste0(OUT_DIR, NAME, "_SCT_snn_res.0.1_clr4.markers.pdf"), h=9, w=12)
+FeaturePlot(ncol=3, name, features=clr4.markers) 
+dev.off()
+```
+
+```{r, fig.height=9, fig.width=12}
+markers.matrix <- read.csv2(paste0(OUT_DIR, "FGF_marker_table_res.0.1.csv"))
+clr5.markers <- markers.matrix$gene[markers.matrix$cluster=="5"][1:9]
+pdf(paste0(OUT_DIR, NAME, "_SCT_snn_res.0.1_clr5.markers.pdf"), h=9, w=12)
+FeaturePlot(ncol=3, name, features=clr5.markers) 
+dev.off()
+```
+
+```{r, fig.height=9, fig.width=12}
+markers.matrix <- read.csv2(paste0(OUT_DIR, "FGF_marker_table_res.0.1.csv"))
+clr6.markers <- markers.matrix$gene[markers.matrix$cluster=="6"][1:9]
+pdf(paste0(OUT_DIR, NAME, "_SCT_snn_res.0.1_clr6.markers.pdf"), h=9, w=12)
+FeaturePlot(ncol=3, name, features=clr6.markers) 
+dev.off()
+```
+
+```{r}
+pdf(paste0(OUT_DIR, "/res.0.1/", NAME, "_SCT_snn_res.0.1.pdf"), h=3, w=4)
+DimPlot(ncol=1, name, group.by="SCT_snn_res.0.1") 
+dev.off()
+```
+
+
+```{r, fig.height=6, fig.width=12}
+DA_progenitor.markers <- c("SHH", "WNT5A", "FOXA2", "OTX2", "EN1", "LMX1A")
+pdf(paste0(OUT_DIR, NAME, "_DA_progenitor.markers.pdf"), h=6, w=12)
+FeaturePlot(ncol=3, name, features=DA_progenitor.markers) #+ ggplot2::ggtitle("DA_progenitor.markers")
+dev.off()
+```
+
+```{r, fig.height=6, fig.width=12}
+Neuronal.differentiation.markers <- c("DLK1", "NEUROD1", "ASCL1")
+pdf(paste0(OUT_DIR, NAME, "_Neuronal.differentiation.markers.pdf"), h=3, w=12) 
+FeaturePlot(ncol=3, name, features=Neuronal.differentiation.markers ) #+ ggplot2::ggtitle("Neuronal.differentiation.markers ")
+dev.off()
+```
+
+Anterior prethalamic lineages are marked by ex- pression of NKX2-2 and OLIG2, 
+while posterior thalamic lineages are characterized by expression of LHX2, DBX1and OLIG3. 
+The differential exposure to ZLI derived SHH is believed to account for this A/P patterning27.
+Molecular characterization of the IsO have found PAX2, EN1, EN2 and PAX5 expression to be defining of this area28. 
+
+
+# 10 Add meta.data
+```{r}
+#'  Change labels for clusters
+#' Make sure the order in new.cluster.ids should correspond to that in levels(name@meta.data[, clr2change])
+changeLabel <- function(name, clr2change, new.cluster.ids) {
+	Idents(name) <- name@meta.data[, clr2change]
+	names(new.cluster.ids) <- levels(name@meta.data[, clr2change])
+	name <- RenameIdents(name, new.cluster.ids)
+	name@meta.data[, clr2change] <- Idents(name)
+	return(name)
+}
+
+name$hash.ID <- as.factor(name$hash.ID)
+name$sample <- name$hash.ID
+new.cluster.ids <- c(rep(rep(c("FGF8", "FGF17"), c(2,2)), 2))
+#levels(name$sample) <- c(levels(name$sample), c("FGF8", "FGF17"))
+name <- changeLabel(name, clr2change="sample", new.cluster.ids)
+```
+
+```{r, fig.height=3, fig.width=5}
+pdf(paste0(OUT_DIR,  NAME, "_FGF8_FGF17_UMAP.pdf"), h=3, w=4.5)
+DimPlot(name, group.by="sample")
+dev.off()
+```
+
+# 11. Annotation
+```{r}
+name$hash.ID <- as.factor(name$hash.ID)
+name$sample <- name$hash.ID
+
+name$annotation <- name$SCT_snn_res.0.1
+
+new.cluster.ids <- c("DA_prog", "cycling_DA_prog1", "Caudal_prog", "Rostral_prog.", "Neuron", "cycling_DA_prog2", "VLMC_prog")
+#levels(name$sample) <- c(levels(name$sample), c("FGF8", "FGF17"))
+name <- changeLabel(name, clr2change="annotation", new.cluster.ids)
+```
+
+```{r, fig.height=3, fig.width=5}
+pdf(paste0(OUT_DIR,  NAME, "_annotation_UMAP.pdf"), h=3, w=5)
+DimPlot(name, group.by="annotation")
+dev.off()
+```
+
+```{r}
+#Cellular compositional analyses
+p <- ggplot(data=name@meta.data) + geom_bar(mapping=aes(x=sample, fill=annotation), position="fill")
+pdf(paste0(OUT_DIR, NAME, "cell_type_over_expr.pdf"), h=4, w=3.5)
+p
+dev.off()
+
+```
+
+```{r, fig.height=7, fig.width=9}
+# Grouped boxplot
+data <- plyr::count(name@meta.data, vars=c("annotation", "sample", "hash.ID"))
+# Calcuate cell type freq in each sample
+#data <- spread(data, key=sample, value=freq)
+#data[, c(3,4)] <- apply(data[, c(3,4)], 2, function(x) as.numeric(as.character(x))/sum(as.numeric(as.character(x))))
+data_fgf8 <- subset(data, sample %in% "FGF8")
+data_fgf17 <- subset(data, sample %in% "FGF17")
+data_fgf8$freq <- as.numeric(as.character(data_fgf8$freq))/sum(as.numeric(as.character(data_fgf8$freq)))
+data_fgf17$freq <- as.numeric(as.character(data_fgf17$freq))/sum(as.numeric(as.character(data_fgf17$freq)))
+data <- rbind(data_fgf8, data_fgf17)
+
+pdf(paste0(OUT_DIR, NAME, "_celltype_proportion_between_protocols.pdf"), h=5, w=8)
+ggplot(data, aes(x=annotation, y=freq, fill=sample)) + 
+    geom_boxplot()
+dev.off()
+```
+
+
+```{r}
+# Cell type count in FGF8 and FGF17 samples separately
+count <- plyr::count(name@meta.data, vars=c("sample", "annotation"))
+count <- spread(count, sample, freq)
+mat <- apply(count[, c(2,3)], 2, function(x) as.numeric(as.character(x)))
+rownames(mat) <- count$annotation
+mat
+write.table(mat, paste0(OUT_DIR,  NAME, "_Rostral_Caudal_count.txt"), row.names=T)
+
+# Cell type frequencies in FGF8 and FGF17 samples separately
+freq <- apply(mat, 2, function(x) x/sum(x))
+freq
+
+# barplot
+pdf(paste0(OUT_DIR,  NAME, "_Rostral_Caudal_barplots.pdf"), h=4, w=2.5)
+barplot(freq["Caudal_prog", ], main="Caudal prog.", ylab="Freq.")
+barplot(freq["Rostral_prog.",], main="Rostral prog.", ylab="Freq.")
+dev.off()
+```
+
+
+# 12. DE seq  between FGF8 and FGF17
+```{r}
+Idents(name) <- name$sample
+DefaultAssay(name) <- "RNA"
+deg <- FindMarkers(name, ident.1 = "FGF8", ident.2 = "FGF17", test.use = "DESeq2")
+head(deg)
+saveRDS(deg, paste0(OUT_DIR, NAME, "_DEseq2_DEGs.RDS"))
+```
+
+```{r}
+deg
+```
+
+```{r}
+write.csv2(deg, paste0(OUT_DIR, NAME, "_diff_expr_table_UP&DOWN.csv"), sep=";")
+
+res <- deg[order(-deg$avg_log2FC),]
+up <- subset(deg, subset=avg_log2FC > 0 &p_val_adj<0.05)
+down <- subset(deg, subset=avg_log2FC < -0 &p_val_adj<0.05)
+
+write.csv2(up, paste0(OUT_DIR, NAME, "_diff_expr_table_UP.csv"), sep=";")
+write.csv2(down, paste0(OUT_DIR, NAME, "_diff_expr_table_DOWN.csv"), sep=";")
+```
+
+
+```{r}
+devtools::install_github('r-lib/ragg')
+BiocManager::install("EnhancedVolcano")
+install.packages('ggrastr')
+```
+
+```{r}
+#https://bioconductor.org/packages/release/bioc/vignettes/EnhancedVolcano/inst/doc/EnhancedVolcano.html
+#res[,"avg_log2FC"] <- as.numeric(as.character(res[, "avg_log2FC"]))
+p1 <- EnhancedVolcano::EnhancedVolcano(res, lab=rownames(res),
+                                      xlim = c(-0.5, 0.5),
+                                      ylim = c(0, 150),
+                                      x='avg_log2FC',
+                                      y="p_val_adj",
+                                      title = "FGF8 (Right) vs. FGF17 (Left)",
+                                      pCutoff = 0.05,
+                                      FCcutoff = 0,
+                                      pointSize = 2,
+                                      labSize = 4.0,
+                                      #col <- c("black", "black", "black", "red3"),
+                                      colAlpha = 0.4)
+
+pdf(paste0(OUT_DIR, NAME, "_diff_expr_volcanoPlot.pdf"), h=7, w=7)
+p1
+dev.off()
+
+p2 <- EnhancedVolcano::EnhancedVolcano(res, lab=rownames(res),
+                                      xlim = c(-0.5, 0.5),
+                                      ylim = c(0, 150),
+                                      x='avg_log2FC',
+                                      y="p_val_adj",
+                                      title = "FGF8 (Right) vs. FGF17 (Left)",
+                                      pCutoff = 0.05,
+                                      FCcutoff = 0.25,
+                                      pointSize = 2,
+                                      labSize = 4.0,
+                                      #col <- c("black", "black", "black", "red3"),
+                                      colAlpha = 0.4)
+
+pdf(paste0(OUT_DIR, NAME, "_diff_expr_volcanoPlot_log2FCcuttoff0.25.pdf"), h=7, w=7)
+p2
+dev.off()
+```
+
+
+
+
+# 14 check the top DEGs
+```{r}
+FGF17_DEGs <- rownames(down)[1:12]
+DefaultAssay(name) <- "SCT"
+pdf(paste0(OUT_DIR, NAME, "_top_upregulated_genes_in_FGF17.pdf"), h=9, w=6)
+VlnPlot(name, features = FGF17_DEGs, split.by="sample",  ncol = 3, pt.size=0)
+dev.off()
+```
+
+```{r}
+FGF8_DEGs <- rownames(up)[1:12]
+DefaultAssay(name) <- "SCT"
+pdf(paste0(OUT_DIR, NAME, "_top_upregulated_genes_in_FGF8.pdf"), h=9, w=6)
+VlnPlot(name, features = FGF8_DEGs, split.by="sample",  ncol = 3, pt.size=0)
+dev.off()
+```
+
+
+```{r}
+DA_progenitor.markers <- c("SHH", "WNT5A", "FOXA2", "OTX2", "EN1", "LMX1A")
+pdf(paste0(OUT_DIR, NAME, "_violinPlot_DA_progenitor.markers.pdf"), h=5, w=7)
+VlnPlot(name, features = DA_progenitor.markers, split.by="sample",  ncol = 3, pt.size=0)
+dev.off()
+```
+
+# 13. Save files
+```{r}
+saveRDS(name, paste0(OUT_DIR, NAME, "processed.RDS"))
+# name <- readRDS(paste0(OUT_DIR, NAME, "processed.RDS")) 
+```
+
+```{r}
+mat <- plyr::count(name@meta.data, vars=c("sample", "hash.ID", "annotation"))
+mat
+```
+```{r}
+library(openxlsx)
+mat2 <- spread(mat, key=annotation, value=freq)
+mat2
+write.csv2(mat2, paste0(OUT_DIR, "/table/freq.csv"))
+write.xlsx(mat2, paste0(OUT_DIR, "/table/freq.xlsx"))
+```
+
+
+
+# 14
+```{r}
+sink(paste0(OUT_DIR, "sessionInfo.txt"))
+sessionInfo()
+sink()
+```
